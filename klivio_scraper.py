@@ -1,57 +1,31 @@
 #!/usr/bin/env python3
 """
-Klivio Lead Scraper — Master Script
-Поддържа: Google Maps, Yell.com, Yellow Pages AU/CA, Clutch.co,
-          ProductHunt, LinkedIn (public), Indie Hackers
-Изход: leads.csv с всички полета за klivio_ai_system.py
+Klivio Scraper v2 — Common Crawl + Clutch + Apollo Public
+100% автоматично от GitHub Actions, без блокиране
 """
 
-import asyncio
-import csv
-import json
-import os
-import random
-import re
-import time
-import logging
-from dataclasses import dataclass, fields, asdict
+import csv, json, logging, os, random, re, time
+from dataclasses import dataclass, asdict, fields
 from datetime import datetime
-from typing import Optional
-from urllib.parse import urlencode, quote_plus
-
+from pathlib import Path
+from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(), logging.FileHandler("scraper.log")]
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
+                    handlers=[logging.StreamHandler()])
 log = logging.getLogger("klivio")
 
-# ─── КОНФИГУРАЦИЯ ────────────────────────────────────────────────
-GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")   # за Google Maps API
 OUTPUT_FILE = "leads.csv"
-DELAY_MIN = 1.5    # секунди между заявки
-DELAY_MAX = 3.5
-MAX_RETRIES = 3
-
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
     "Accept-Language": "en-GB,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-# ─── DATA MODEL ─────────────────────────────────────────────────
 @dataclass
 class Lead:
     business_name: str = ""
     first_name: str = ""
-    last_name: str = ""
     email: str = ""
     phone: str = ""
     website: str = ""
@@ -61,607 +35,325 @@ class Lead:
     source: str = ""
     google_rating: str = ""
     google_reviews: str = ""
-    linkedin_url: str = ""
-    tier: str = "Tier3"           # Tier1 / Tier2 / Tier3
-    sequence: str = "E"           # A B C D E F G1 G2 G3
+    tier: str = "Tier1"
+    sequence: str = "A"
     scraped_at: str = ""
-    notes: str = ""
+    pain_points: str = ""
+    website_summary: str = ""
+    weak_reviews: str = ""
+    opportunity: str = ""
 
 CSV_FIELDS = [f.name for f in fields(Lead)]
 
-def save_leads(leads: list[Lead], filepath: str = OUTPUT_FILE):
-    """Запазва leads в CSV — appends ако файлът съществува."""
-    file_exists = os.path.exists(filepath)
-    with open(filepath, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        if not file_exists:
-            writer.writeheader()
+def save_leads(leads):
+    if not leads: return
+    exists = Path(OUTPUT_FILE).exists()
+    with open(OUTPUT_FILE, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        if not exists: w.writeheader()
         for lead in leads:
             lead.scraped_at = datetime.now().isoformat()
-            writer.writerow(asdict(lead))
-    log.info(f"Saved {len(leads)} leads → {filepath}")
+            w.writerow(asdict(lead))
+    log.info(f"Saved {len(leads)} leads → {OUTPUT_FILE}")
 
+def extract_email(text):
+    matches = re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", text)
+    skip = ["noreply","no-reply","donotreply","example","test","spam","abuse","privacy","support@support"]
+    for m in matches:
+        if not any(s in m.lower() for s in skip):
+            return m
+    return ""
 
-def random_delay():
-    time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
-
-
-def safe_get(url: str, params: dict = None, retries: int = MAX_RETRIES) -> Optional[requests.Response]:
-    for attempt in range(retries):
+def safe_get(url, params=None, timeout=15):
+    for i in range(2):
         try:
-            r = requests.get(url, headers=HEADERS, params=params, timeout=15)
-            r.raise_for_status()
-            return r
-        except requests.RequestException as e:
-            log.warning(f"Attempt {attempt+1}/{retries} failed for {url}: {e}")
-            time.sleep(2 ** attempt)
+            r = requests.get(url, headers=HEADERS, params=params, timeout=timeout)
+            if r.status_code == 200: return r
+        except: pass
+        time.sleep(2)
     return None
 
+def assign_sequence(industry):
+    i = industry.lower()
+    if any(k in i for k in ["estate","property","realtor","letting","real estate"]): return "Tier1","A"
+    if any(k in i for k in ["marketing","agency","digital","seo","web","it ","software","tech","saas"]): return "Tier1","B"
+    if any(k in i for k in ["account","finance","mortgage","legal","solicitor","insurance","tax"]): return "Tier1","C"
+    if any(k in i for k in ["dental","health","physio","hvac","plumb","electric","build","trade"]): return "Tier2","D"
+    return "Tier1","B"
 
-def extract_email_from_text(text: str) -> str:
-    """Извлича първия имейл от произволен текст."""
-    match = re.search(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", text)
-    return match.group(0) if match else ""
+# ─── SCRAPER 1: COMMON CRAWL CDX API ─────────────────────────────
+def scrape_common_crawl(industry: str, country: str, max_results: int = 80) -> list[Lead]:
+    """Common Crawl Index API — безплатно, без блокиране, работи от GitHub."""
+    leads = []
+    log.info(f"Common Crawl: '{industry}' / {country}")
+
+    tld_map = {"UK":".co.uk","Ireland":".ie","Australia":".com.au","Canada":".ca","UAE":".ae","Global":".com"}
+    tld = tld_map.get(country, ".com")
+
+    # Keyword patterns за индустрията
+    kw_map = {
+        "estate agent":     ["estateagent","propertysales","lettingsagent","realestate"],
+        "marketing agency": ["marketingagency","digitalagency","creativeagency","seoagency"],
+        "accountant":       ["accountants","accounting","bookkeeping","taxadvisors"],
+        "mortgage broker":  ["mortgagebroker","mortgageadvice","homeloans"],
+        "digital agency":   ["digitalagency","webagency","onlinemarketing"],
+        "real estate":      ["realestate","propertyagency","propertydevelopers"],
+        "software company": ["software","techcompany","saas","appdev"],
+        "accountant":       ["accountingfirm","taxservices","cpa"],
+        "recruitment":      ["recruitment","staffingagency","hiring"],
+        "dental":           ["dentalclinic","dentist","dentalcare"],
+    }
+
+    keywords = []
+    for key, vals in kw_map.items():
+        if any(k in industry.lower() for k in key.split()):
+            keywords = vals
+            break
+    if not keywords:
+        keywords = [industry.lower().replace(" ","")]
+
+    # Latest Common Crawl index
+    index_url = "https://index.commoncrawl.org/CC-MAIN-2024-51-index"
+
+    for kw in keywords[:2]:
+        query = f"*{tld}/{kw}*" if country != "Global" else f"*.com/{kw}*"
+        try:
+            r = requests.get(index_url, params={"url": query, "output": "json", "limit": 40,
+                                                  "fl": "url", "filter": "status:200"}, timeout=25)
+            if not r.ok:
+                # Try alternative query format
+                query2 = f"*{kw}*{tld}*"
+                r = requests.get(index_url, params={"url": query2, "output": "json", "limit": 40,
+                                                     "fl": "url", "filter": "status:200"}, timeout=25)
+                if not r.ok: continue
+
+            urls = []
+            for line in r.text.strip().split("\n"):
+                if not line: continue
+                try:
+                    obj = json.loads(line)
+                    u = obj.get("url","")
+                    if u and not any(skip in u for skip in ["wikipedia","facebook","linkedin","twitter","instagram"]):
+                        urls.append(u)
+                except: continue
+
+            log.info(f"  CDX: {len(urls)} URLs за '{kw}'")
+
+            for url in urls[:20]:
+                if len(leads) >= max_results: break
+                lead = extract_from_url(url, industry, country)
+                if lead and lead.email and lead.business_name:
+                    tier, seq = assign_sequence(industry)
+                    lead.tier, lead.sequence = tier, seq
+                    leads.append(lead)
+                time.sleep(random.uniform(0.8, 1.8))
+
+        except Exception as e:
+            log.warning(f"CDX error for '{kw}': {e}")
+
+    log.info(f"Common Crawl total: {len(leads)} leads с имейл")
+    return leads
 
 
-def extract_email_from_website(url: str) -> str:
-    """Посещава website и търси имейл адрес."""
-    if not url:
-        return ""
+def extract_from_url(url: str, industry: str, country: str) -> Lead:
     try:
         r = safe_get(url)
-        if not r:
-            return ""
+        if not r: return None
         soup = BeautifulSoup(r.text, "html.parser")
-        # Търси mailto: линкове
+
+        # Название
+        name = ""
+        title = soup.find("title")
+        if title:
+            name = re.sub(r"\s*[-|:—]\s*.*$", "", title.get_text(strip=True)).strip()[:70]
+        if not name:
+            og = soup.find("meta", property="og:site_name")
+            if og: name = og.get("content","").strip()[:70]
+
+        # Имейл
+        email = ""
         for a in soup.find_all("a", href=True):
             if "mailto:" in a["href"]:
-                return a["href"].replace("mailto:", "").split("?")[0].strip()
-        # Търси в текста
-        return extract_email_from_text(soup.get_text())
+                candidate = a["href"].replace("mailto:","").split("?")[0].strip()
+                skip = ["noreply","no-reply","example","test","spam","abuse"]
+                if candidate and not any(s in candidate.lower() for s in skip):
+                    email = candidate
+                    break
+        if not email:
+            email = extract_email(soup.get_text())
+
+        if not email or not name: return None
+
+        # Телефон
+        phone = ""
+        phone_match = re.search(r"(\+[\d\s\-\(\)]{9,18}|0[\d\s\-]{9,14})", soup.get_text())
+        if phone_match: phone = phone_match.group(0).strip()
+
+        parsed = urlparse(url)
+        website = f"{parsed.scheme}://{parsed.netloc}"
+
+        # Град от meta или contact page
+        city = ""
+        loc = soup.find("meta", attrs={"name": re.compile("geo.placename|location", re.I)})
+        if loc: city = loc.get("content","").strip()
+
+        return Lead(business_name=name, email=email, phone=phone, website=website,
+                    city=city, country=country, industry=industry, source="common_crawl")
     except Exception as e:
-        log.debug(f"Email extract failed for {url}: {e}")
-        return ""
+        log.debug(f"Extract error {url}: {e}")
+        return None
 
 
-def assign_tier_and_sequence(industry: str, source: str) -> tuple[str, str]:
-    """Определя Tier и Sequence по индустрия."""
-    industry_lower = industry.lower()
-    source_lower = source.lower()
-
-    # Online бизнеси → Tier 1
-    if any(k in source_lower for k in ["clutch", "producthunt", "indie", "g2", "linkedin"]):
-        if any(k in industry_lower for k in ["saas", "software", "tech", "dev", "app"]):
-            return "Tier1", "G1"
-        if any(k in industry_lower for k in ["agency", "seo", "content", "marketing", "design"]):
-            return "Tier1", "G2"
-        if any(k in industry_lower for k in ["coach", "consult", "training"]):
-            return "Tier1", "G3"
-        return "Tier1", "G2"  # default за online
-
-    # Offline Tier 1
-    if any(k in industry_lower for k in ["estate", "real estate", "property", "letting", "realtor"]):
-        return "Tier1", "A"
-    if any(k in industry_lower for k in ["marketing", "digital", "it ", "msp", "managed service", "web design"]):
-        return "Tier1", "B"
-    if any(k in industry_lower for k in ["account", "mortgage", "financial", "solicitor", "legal", "insurance"]):
-        return "Tier1", "C"
-
-    # Tier 2
-    if any(k in industry_lower for k in ["dental", "physio", "health", "clinic", "hvac", "plumb", "electric", "builder", "construct"]):
-        return "Tier2", "D"
-
-    return "Tier3", "E"
-
-
-# ─── SCRAPER 1: GOOGLE MAPS API ──────────────────────────────────
-def scrape_google_maps(keyword: str, location: str, country: str, max_results: int = 60) -> list[Lead]:
-    """
-    Scrape Google Maps Places API.
-    Изисква GOOGLE_MAPS_API_KEY в .env
-    """
-    if not GOOGLE_MAPS_API_KEY:
-        log.warning("GOOGLE_MAPS_API_KEY not set — skipping Google Maps scraper")
-        return []
-
+# ─── SCRAPER 2: CLUTCH.CO ─────────────────────────────────────────
+def scrape_clutch(service: str, max_pages: int = 4) -> list[Lead]:
+    """Clutch.co — работи от GitHub без блокиране."""
     leads = []
-    query = f"{keyword} in {location}"
-    url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-    params = {"query": query, "key": GOOGLE_MAPS_API_KEY, "language": "en"}
+    slug = service.lower().replace(" ", "-")
 
-    log.info(f"Google Maps: '{query}'")
-
-    while len(leads) < max_results:
+    for page in range(1, max_pages + 1):
+        url = f"https://clutch.co/agencies/{slug}"
+        params = {"page": page} if page > 1 else {}
         r = safe_get(url, params=params)
-        if not r:
-            break
-        data = r.json()
-        results = data.get("results", [])
-        if not results:
-            break
-
-        for place in results:
-            name = place.get("name", "")
-            address = place.get("formatted_address", "")
-            rating = str(place.get("rating", ""))
-            reviews = str(place.get("user_ratings_total", ""))
-            place_id = place.get("place_id", "")
-
-            # Details call за website + phone
-            website, phone = "", ""
-            if place_id:
-                det_url = "https://maps.googleapis.com/maps/api/place/details/json"
-                det_params = {"place_id": place_id, "fields": "website,formatted_phone_number", "key": GOOGLE_MAPS_API_KEY}
-                det_r = safe_get(det_url, params=det_params)
-                if det_r:
-                    det = det_r.json().get("result", {})
-                    website = det.get("website", "")
-                    phone = det.get("formatted_phone_number", "")
-                random_delay()
-
-            email = extract_email_from_website(website)
-            tier, seq = assign_tier_and_sequence(keyword, "google_maps")
-
-            leads.append(Lead(
-                business_name=name,
-                email=email,
-                phone=phone,
-                website=website,
-                city=location,
-                country=country,
-                industry=keyword,
-                source="google_maps",
-                google_rating=rating,
-                google_reviews=reviews,
-                tier=tier,
-                sequence=seq,
-            ))
-            if len(leads) >= max_results:
-                break
-
-        next_token = data.get("next_page_token")
-        if not next_token:
-            break
-        params = {"pagetoken": next_token, "key": GOOGLE_MAPS_API_KEY}
-        time.sleep(2)  # Google изисква delay преди next_page_token
-
-    log.info(f"Google Maps: {len(leads)} leads за '{query}'")
-    return leads
-
-
-# ─── SCRAPER 2: YELL.COM (UK) ────────────────────────────────────
-def scrape_yell(keyword: str, location: str, max_pages: int = 5) -> list[Lead]:
-    """Scrape Yell.com за UK бизнеси."""
-    leads = []
-    base_url = "https://www.yell.com/ucs/UcsSearchAction.do"
-
-    for page in range(1, max_pages + 1):
-        params = {
-            "keywords": keyword,
-            "location": location,
-            "pageNum": page,
-        }
-        log.info(f"Yell.com: '{keyword}' в {location} — страница {page}")
-        r = safe_get(base_url, params=params)
-        if not r:
-            break
+        if not r: break
 
         soup = BeautifulSoup(r.text, "html.parser")
-        listings = soup.find_all("article", class_=re.compile("businessCapsule"))
+        companies = soup.find_all("li", class_=re.compile("provider-row|providers__item"))
+        if not companies: break
 
-        if not listings:
-            log.info(f"Yell: Няма повече резултати на страница {page}")
-            break
-
-        for listing in listings:
-            name_tag = listing.find(class_=re.compile("businessCapsule--name"))
+        for co in companies:
+            name_tag = co.find(class_=re.compile("company_info|provider__title|sg-provider-name"))
             name = name_tag.get_text(strip=True) if name_tag else ""
 
-            phone_tag = listing.find("span", class_=re.compile("business-phone"))
-            phone = phone_tag.get_text(strip=True) if phone_tag else ""
+            website = ""
+            for a in co.find_all("a", href=True):
+                href = a["href"]
+                if href.startswith("http") and "clutch.co" not in href and "linkedin" not in href:
+                    website = href
+                    break
 
-            website_tag = listing.find("a", class_=re.compile("businessCapsule--website"))
-            website = website_tag.get("href", "") if website_tag else ""
-            if website.startswith("//"):
-                website = "https:" + website
+            loc_tag = co.find(class_=re.compile("locality|location|sg-provider-location"))
+            city = loc_tag.get_text(strip=True) if loc_tag else ""
 
-            email = extract_email_from_website(website) if website else ""
-            tier, seq = assign_tier_and_sequence(keyword, "yell")
+            email = ""
+            if website:
+                r2 = safe_get(website)
+                if r2:
+                    soup2 = BeautifulSoup(r2.text, "html.parser")
+                    for a in soup2.find_all("a", href=True):
+                        if "mailto:" in a["href"]:
+                            email = a["href"].replace("mailto:","").split("?")[0].strip()
+                            break
+                    if not email: email = extract_email(soup2.get_text())
+                time.sleep(random.uniform(1, 2))
 
-            leads.append(Lead(
-                business_name=name,
-                email=email,
-                phone=phone,
-                website=website,
-                city=location,
-                country="UK",
-                industry=keyword,
-                source="yell.com",
-                tier=tier,
-                sequence=seq,
-            ))
-            random_delay()
-
-        random_delay()
-
-    log.info(f"Yell.com: {len(leads)} leads за '{keyword}' в {location}")
-    return leads
-
-
-# ─── SCRAPER 3: YELLOW PAGES AUSTRALIA ───────────────────────────
-def scrape_yellowpages_au(keyword: str, location: str, max_pages: int = 5) -> list[Lead]:
-    """Scrape Yellow Pages Australia."""
-    leads = []
-
-    for page in range(1, max_pages + 1):
-        url = f"https://www.yellowpages.com.au/search/listings?clue={quote_plus(keyword)}&locationClue={quote_plus(location)}&pageNumber={page}"
-        log.info(f"YP Australia: '{keyword}' в {location} — страница {page}")
-        r = safe_get(url)
-        if not r:
-            break
-
-        soup = BeautifulSoup(r.text, "html.parser")
-        listings = soup.find_all("div", class_=re.compile("listing-"))
-
-        if not listings:
-            break
-
-        for listing in listings:
-            name_tag = listing.find(class_=re.compile("listing-name"))
-            name = name_tag.get_text(strip=True) if name_tag else ""
-
-            phone_tag = listing.find(class_=re.compile("phone"))
-            phone = phone_tag.get_text(strip=True) if phone_tag else ""
-
-            website_tag = listing.find("a", href=re.compile(r"^https?://"))
-            website = website_tag.get("href", "") if website_tag else ""
-
-            email = extract_email_from_website(website) if website else ""
-            tier, seq = assign_tier_and_sequence(keyword, "yellowpages_au")
-
-            if name:
-                leads.append(Lead(
-                    business_name=name,
-                    email=email,
-                    phone=phone,
-                    website=website,
-                    city=location,
-                    country="Australia",
-                    industry=keyword,
-                    source="yellowpages_au",
-                    tier=tier,
-                    sequence=seq,
-                ))
-            random_delay()
-
-        random_delay()
-
-    log.info(f"YP AU: {len(leads)} leads")
-    return leads
-
-
-# ─── SCRAPER 4: YELLOW PAGES CANADA ──────────────────────────────
-def scrape_yellowpages_ca(keyword: str, location: str, max_pages: int = 5) -> list[Lead]:
-    """Scrape Yellow Pages Canada."""
-    leads = []
-
-    for page in range(1, max_pages + 1):
-        url = f"https://www.yellowpages.ca/search/si/{page}/{quote_plus(keyword)}/{quote_plus(location)}"
-        log.info(f"YP Canada: '{keyword}' в {location} — страница {page}")
-        r = safe_get(url)
-        if not r:
-            break
-
-        soup = BeautifulSoup(r.text, "html.parser")
-        listings = soup.find_all("div", class_=re.compile("listing__content"))
-
-        if not listings:
-            break
-
-        for listing in listings:
-            name_tag = listing.find(class_=re.compile("listing__name"))
-            name = name_tag.get_text(strip=True) if name_tag else ""
-
-            phone_tag = listing.find(class_=re.compile("listing__phone"))
-            phone = phone_tag.get_text(strip=True) if phone_tag else ""
-
-            website_tag = listing.find("a", class_=re.compile("website"))
-            website = website_tag.get("href", "") if website_tag else ""
-
-            email = extract_email_from_website(website) if website else ""
-            tier, seq = assign_tier_and_sequence(keyword, "yellowpages_ca")
-
-            if name:
-                leads.append(Lead(
-                    business_name=name,
-                    email=email,
-                    phone=phone,
-                    website=website,
-                    city=location,
-                    country="Canada",
-                    industry=keyword,
-                    source="yellowpages_ca",
-                    tier=tier,
-                    sequence=seq,
-                ))
-            random_delay()
-
-        random_delay()
-
-    log.info(f"YP CA: {len(leads)} leads")
-    return leads
-
-
-# ─── SCRAPER 5: CLUTCH.CO (Online Agencies) ──────────────────────
-def scrape_clutch(service: str, location: str = "", max_pages: int = 5) -> list[Lead]:
-    """
-    Scrape Clutch.co за digital agencies и tech companies.
-    Перфектно за Sequence G2.
-    """
-    leads = []
-    service_slug = service.lower().replace(" ", "-")
-
-    for page in range(1, max_pages + 1):
-        url = f"https://clutch.co/agencies/{service_slug}"
-        params = {}
-        if location:
-            params["geographic_focus"] = location
-        if page > 1:
-            params["page"] = page
-
-        log.info(f"Clutch: '{service}' — страница {page}")
-        r = safe_get(url, params=params)
-        if not r:
-            break
-
-        soup = BeautifulSoup(r.text, "html.parser")
-        companies = soup.find_all("li", class_=re.compile("provider-row"))
-
-        if not companies:
-            break
-
-        for company in companies:
-            name_tag = company.find(class_=re.compile("company_info"))
-            if not name_tag:
-                name_tag = company.find("h3")
-            name = name_tag.get_text(strip=True) if name_tag else ""
-
-            website_tag = company.find("a", class_=re.compile("website-link"))
-            website = website_tag.get("href", "") if website_tag else ""
-
-            email = extract_email_from_website(website) if website else ""
-
-            location_tag = company.find(class_=re.compile("location"))
-            city = location_tag.get_text(strip=True) if location_tag else location
-
-            if name:
-                leads.append(Lead(
-                    business_name=name,
-                    email=email,
-                    website=website,
-                    city=city,
-                    country="Global",
-                    industry=service,
-                    source="clutch.co",
-                    tier="Tier1",
-                    sequence="G2",
-                ))
-            random_delay()
-
-        random_delay()
+            if name and email:
+                leads.append(Lead(business_name=name, email=email, website=website or "",
+                                  city=city, country="Global", industry=service,
+                                  source="clutch.co", tier="Tier1", sequence="G2"))
+        time.sleep(random.uniform(2, 3))
 
     log.info(f"Clutch: {len(leads)} leads за '{service}'")
     return leads
 
 
-# ─── SCRAPER 6: INDIE HACKERS ─────────────────────────────────────
-def scrape_indie_hackers(max_pages: int = 3) -> list[Lead]:
-    """
-    Scrape Indie Hackers products за bootstrap SaaS founders.
-    Sequence G1 — Tier 1.
-    """
+# ─── SCRAPER 3: APOLLO PUBLIC ─────────────────────────────────────
+def scrape_apollo_public(industry: str, country: str) -> list[Lead]:
+    """Apollo.io публични данни."""
     leads = []
+    country_map = {"UK":"United Kingdom","Ireland":"Ireland","Australia":"Australia",
+                   "Canada":"Canada","UAE":"United Arab Emirates"}
+    country_name = country_map.get(country, country)
 
-    for page in range(1, max_pages + 1):
-        url = f"https://www.indiehackers.com/products?page={page}"
-        log.info(f"Indie Hackers — страница {page}")
-        r = safe_get(url)
-        if not r:
-            break
+    try:
+        r = requests.post("https://api.apollo.io/api/v1/mixed_companies/search",
+            json={"q_organization_keyword_tags":[industry],
+                  "organization_locations":[country_name], "page":1, "per_page":25},
+            headers={**HEADERS,"Content-Type":"application/json"}, timeout=15)
+        if not r.ok: return leads
 
-        soup = BeautifulSoup(r.text, "html.parser")
-        products = soup.find_all("div", class_=re.compile("product-summary"))
+        for c in r.json().get("organizations", []):
+            name = c.get("name","")
+            website = c.get("website_url","")
+            city = c.get("city","")
+            email = ""
+            if website:
+                r2 = safe_get(website)
+                if r2:
+                    soup = BeautifulSoup(r2.text, "html.parser")
+                    for a in soup.find_all("a", href=True):
+                        if "mailto:" in a["href"]:
+                            email = a["href"].replace("mailto:","").split("?")[0].strip()
+                            break
+                    if not email: email = extract_email(soup.get_text())
+                time.sleep(random.uniform(1, 2))
 
-        if not products:
-            break
+            if name and email:
+                tier, seq = assign_sequence(industry)
+                leads.append(Lead(business_name=name, email=email, website=website,
+                                  city=city, country=country, industry=industry,
+                                  source="apollo_public", tier=tier, sequence=seq))
+    except Exception as e:
+        log.warning(f"Apollo error: {e}")
 
-        for product in products:
-            name_tag = product.find(class_=re.compile("product-summary__name"))
-            name = name_tag.get_text(strip=True) if name_tag else ""
-
-            website_tag = product.find("a", class_=re.compile("product-summary__tagline"))
-            website = website_tag.get("href", "") if website_tag else ""
-
-            founder_tag = product.find(class_=re.compile("user-link"))
-            founder = founder_tag.get_text(strip=True) if founder_tag else ""
-
-            email = extract_email_from_website(website) if website else ""
-
-            if name:
-                leads.append(Lead(
-                    business_name=name,
-                    first_name=founder,
-                    email=email,
-                    website=website,
-                    city="Remote",
-                    country="Global",
-                    industry="SaaS / Startup",
-                    source="indiehackers",
-                    tier="Tier1",
-                    sequence="G1",
-                ))
-            random_delay()
-
-        random_delay()
-
-    log.info(f"Indie Hackers: {len(leads)} leads")
+    log.info(f"Apollo: {len(leads)} leads за '{industry}'")
     return leads
 
 
-# ─── SCRAPER 7: GOLDEN PAGES IRELAND ────────────────────────────
-def scrape_golden_pages(keyword: str, location: str, max_pages: int = 5) -> list[Lead]:
-    """Scrape GoldenPages.ie за Ireland бизнеси."""
-    leads = []
-
-    for page in range(1, max_pages + 1):
-        url = f"https://www.goldenpages.ie/q/business/advanced/where/{quote_plus(location)}/what/{quote_plus(keyword)}/page/{page}/"
-        log.info(f"Golden Pages IE: '{keyword}' в {location} — страница {page}")
-        r = safe_get(url)
-        if not r:
-            break
-
-        soup = BeautifulSoup(r.text, "html.parser")
-        listings = soup.find_all("div", class_=re.compile("listing"))
-
-        if not listings:
-            break
-
-        for listing in listings:
-            name_tag = listing.find(class_=re.compile("listing-title"))
-            name = name_tag.get_text(strip=True) if name_tag else ""
-
-            phone_tag = listing.find(class_=re.compile("phone"))
-            phone = phone_tag.get_text(strip=True) if phone_tag else ""
-
-            website_tag = listing.find("a", href=re.compile(r"^https?://"))
-            website = website_tag.get("href", "") if website_tag else ""
-
-            email = extract_email_from_website(website) if website else ""
-            tier, seq = assign_tier_and_sequence(keyword, "golden_pages")
-
-            if name:
-                leads.append(Lead(
-                    business_name=name,
-                    email=email,
-                    phone=phone,
-                    website=website,
-                    city=location,
-                    country="Ireland",
-                    industry=keyword,
-                    source="goldenpages.ie",
-                    tier=tier,
-                    sequence=seq,
-                ))
-            random_delay()
-
-        random_delay()
-
-    log.info(f"Golden Pages IE: {len(leads)} leads")
-    return leads
-
-
-# ─── MAIN CAMPAIGN CONFIG ────────────────────────────────────────
+# ─── CAMPAIGNS ────────────────────────────────────────────────────
 CAMPAIGNS = [
-    # ── UK ──────────────────────────────────────────────────────
-    {"scraper": "yell",        "keyword": "estate agent",         "location": "London",     "country": "UK"},
-    {"scraper": "yell",        "keyword": "estate agent",         "location": "Manchester", "country": "UK"},
-    {"scraper": "yell",        "keyword": "marketing agency",     "location": "London",     "country": "UK"},
-    {"scraper": "yell",        "keyword": "accountant",           "location": "Birmingham", "country": "UK"},
-    {"scraper": "yell",        "keyword": "mortgage broker",      "location": "London",     "country": "UK"},
-    {"scraper": "google_maps", "keyword": "letting agent",        "location": "Leeds",      "country": "UK"},
-    {"scraper": "google_maps", "keyword": "solicitor",            "location": "Manchester", "country": "UK"},
-
-    # ── Ireland ─────────────────────────────────────────────────
-    {"scraper": "golden_pages", "keyword": "estate agent",        "location": "Dublin",     "country": "Ireland"},
-    {"scraper": "golden_pages", "keyword": "mortgage broker",     "location": "Dublin",     "country": "Ireland"},
-    {"scraper": "golden_pages", "keyword": "accountant",          "location": "Cork",       "country": "Ireland"},
-
-    # ── Australia ────────────────────────────────────────────────
-    {"scraper": "yellowpages_au", "keyword": "real estate agent", "location": "Sydney",     "country": "Australia"},
-    {"scraper": "yellowpages_au", "keyword": "mortgage broker",   "location": "Melbourne",  "country": "Australia"},
-    {"scraper": "yellowpages_au", "keyword": "digital agency",    "location": "Brisbane",   "country": "Australia"},
-    {"scraper": "google_maps",    "keyword": "dental clinic",     "location": "Perth",      "country": "Australia"},
-
-    # ── Canada ───────────────────────────────────────────────────
-    {"scraper": "yellowpages_ca", "keyword": "realtor",           "location": "Toronto",    "country": "Canada"},
-    {"scraper": "yellowpages_ca", "keyword": "mortgage broker",   "location": "Vancouver",  "country": "Canada"},
-    {"scraper": "yellowpages_ca", "keyword": "IT company",        "location": "Toronto",    "country": "Canada"},
-
-    # ── UAE ──────────────────────────────────────────────────────
-    {"scraper": "google_maps", "keyword": "real estate agency",   "location": "Dubai",      "country": "UAE"},
-    {"scraper": "google_maps", "keyword": "property developer",   "location": "Abu Dhabi",  "country": "UAE"},
-    {"scraper": "google_maps", "keyword": "financial consultant",  "location": "Dubai",     "country": "UAE"},
-
-    # ── Online бизнеси (Global) ──────────────────────────────────
-    {"scraper": "clutch",      "keyword": "digital-marketing",    "location": "",           "country": "Global"},
-    {"scraper": "clutch",      "keyword": "seo",                  "location": "",           "country": "Global"},
-    {"scraper": "clutch",      "keyword": "web-development",      "location": "",           "country": "Global"},
-    {"scraper": "indie_hackers", "keyword": "",                   "location": "",           "country": "Global"},
+    {"scraper":"common_crawl", "industry":"estate agent",      "country":"UK"},
+    {"scraper":"common_crawl", "industry":"marketing agency",  "country":"UK"},
+    {"scraper":"common_crawl", "industry":"accountant",        "country":"UK"},
+    {"scraper":"common_crawl", "industry":"mortgage broker",   "country":"Ireland"},
+    {"scraper":"common_crawl", "industry":"estate agent",      "country":"Australia"},
+    {"scraper":"common_crawl", "industry":"digital agency",    "country":"Australia"},
+    {"scraper":"common_crawl", "industry":"accountant",        "country":"Canada"},
+    {"scraper":"common_crawl", "industry":"real estate",       "country":"UAE"},
+    {"scraper":"common_crawl", "industry":"marketing agency",  "country":"Global"},
+    {"scraper":"common_crawl", "industry":"software company",  "country":"Global"},
+    {"scraper":"clutch",       "industry":"digital-marketing", "country":"Global"},
+    {"scraper":"clutch",       "industry":"seo",               "country":"Global"},
+    {"scraper":"clutch",       "industry":"web-development",   "country":"Global"},
+    {"scraper":"apollo",       "industry":"estate agent",      "country":"UK"},
+    {"scraper":"apollo",       "industry":"marketing agency",  "country":"Australia"},
 ]
 
-
-def run_campaign(campaign: dict) -> list[Lead]:
-    scraper = campaign["scraper"]
-    keyword = campaign.get("keyword", "")
-    location = campaign.get("location", "")
-    country = campaign.get("country", "Global")
-
-    if scraper == "yell":
-        return scrape_yell(keyword, location)
-    elif scraper == "yellowpages_au":
-        return scrape_yellowpages_au(keyword, location)
-    elif scraper == "yellowpages_ca":
-        return scrape_yellowpages_ca(keyword, location)
-    elif scraper == "golden_pages":
-        return scrape_golden_pages(keyword, location)
-    elif scraper == "google_maps":
-        return scrape_google_maps(keyword, location, country)
-    elif scraper == "clutch":
-        return scrape_clutch(keyword, location)
-    elif scraper == "indie_hackers":
-        return scrape_indie_hackers()
-    else:
-        log.warning(f"Непознат scraper: {scraper}")
-        return []
-
-
 def main():
-    log.info("=" * 60)
-    log.info("Klivio Lead Scraper — старт")
-    log.info(f"Брой campaigns: {len(CAMPAIGNS)}")
-    log.info("=" * 60)
+    log.info("="*55)
+    log.info("Klivio Scraper v2 — Common Crawl + Clutch + Apollo")
+    log.info(f"Campaigns: {len(CAMPAIGNS)}")
+    log.info("="*55)
 
-    total_leads = 0
+    existing = set()
+    if Path(OUTPUT_FILE).exists():
+        with open(OUTPUT_FILE, encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                existing.add(row.get("email",""))
+        log.info(f"Вече имаме {len(existing)} leads")
 
-    for i, campaign in enumerate(CAMPAIGNS, 1):
-        log.info(f"\n[{i}/{len(CAMPAIGNS)}] {campaign['scraper'].upper()} — {campaign.get('keyword','')} {campaign.get('location','')}")
+    total = 0
+    for i, c in enumerate(CAMPAIGNS, 1):
+        log.info(f"\n[{i}/{len(CAMPAIGNS)}] {c['scraper'].upper()} — {c.get('industry','')} / {c.get('country','')}")
         try:
-            leads = run_campaign(campaign)
-            # Филтрирай само leads с имейл за по-добро качество
-            leads_with_email = [l for l in leads if l.email]
-            leads_without = [l for l in leads if not l.email]
+            if c["scraper"] == "common_crawl":
+                leads = scrape_common_crawl(c["industry"], c["country"])
+            elif c["scraper"] == "clutch":
+                leads = scrape_clutch(c["industry"])
+            elif c["scraper"] == "apollo":
+                leads = scrape_apollo_public(c["industry"], c["country"])
+            else:
+                leads = []
 
-            if leads_with_email:
-                save_leads(leads_with_email, OUTPUT_FILE)
-            if leads_without:
-                save_leads(leads_without, "leads_no_email.csv")
-
-            total_leads += len(leads)
-            log.info(f"✓ {len(leads_with_email)} с имейл | {len(leads_without)} без имейл")
-
-        except KeyboardInterrupt:
-            log.info("Прекъснато от потребителя.")
-            break
+            new = [l for l in leads if l.email and l.email not in existing]
+            if new:
+                save_leads(new)
+                for l in new: existing.add(l.email)
+                total += len(new)
+            log.info(f"✓ {len(new)} нови leads")
         except Exception as e:
-            log.error(f"Грешка в campaign {i}: {e}", exc_info=True)
-            continue
+            log.error(f"Campaign {i} грешка: {e}")
 
-    log.info("\n" + "=" * 60)
-    log.info(f"ГОТОВО — Общо leads: {total_leads}")
-    log.info(f"Файл с имейли: {OUTPUT_FILE}")
-    log.info(f"Файл без имейли: leads_no_email.csv")
-    log.info("=" * 60)
-
+    log.info(f"\nГОТОВО — {total} нови leads в {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()
