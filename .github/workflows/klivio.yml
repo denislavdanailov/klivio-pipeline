@@ -1,0 +1,106 @@
+name: Klivio Pipeline
+
+on:
+  schedule:
+    - cron: '0 7 * * 1-5'
+    - cron: '0 * * * *'
+    - cron: '0 18 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Mode'
+        required: true
+        default: 'preview'
+        type: choice
+        options: [preview, live, check, digest]
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 lxml
+
+      - name: Run scraper
+        if: github.event.schedule == '0 7 * * 1-5' || github.event.inputs.mode == 'live'
+        run: python klivio_scraper.py
+
+      - name: Live pipeline
+        if: github.event.schedule == '0 7 * * 1-5'
+        env:
+          YOUR_EMAIL:       ${{ secrets.YOUR_EMAIL }}
+          REPLY_TO_EMAIL:   ${{ secrets.REPLY_TO_EMAIL }}
+          GROQ_API_KEY:     ${{ secrets.GROQ_API_KEY }}
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BREVO_PASS_1:     ${{ secrets.BREVO_PASS_1 }}
+          BREVO_PASS_2:     ${{ secrets.BREVO_PASS_2 }}
+          BREVO_PASS_3:     ${{ secrets.BREVO_PASS_3 }}
+          BREVO_PASS_4:     ${{ secrets.BREVO_PASS_4 }}
+          BREVO_PASS_5:     ${{ secrets.BREVO_PASS_5 }}
+          BREVO_PASS_6:     ${{ secrets.BREVO_PASS_6 }}
+          BREVO_PASS_7:     ${{ secrets.BREVO_PASS_7 }}
+          BREVO_PASS_8:     ${{ secrets.BREVO_PASS_8 }}
+          BREVO_PASS_9:     ${{ secrets.BREVO_PASS_9 }}
+          BREVO_PASS_10:    ${{ secrets.BREVO_PASS_10 }}
+          BREVO_PASS_11:    ${{ secrets.BREVO_PASS_11 }}
+          BREVO_PASS_12:    ${{ secrets.BREVO_PASS_12 }}
+          BREVO_PASS_13:    ${{ secrets.BREVO_PASS_13 }}
+          BREVO_PASS_14:    ${{ secrets.BREVO_PASS_14 }}
+          BREVO_PASS_15:    ${{ secrets.BREVO_PASS_15 }}
+          BREVO_PASS_16:    ${{ secrets.BREVO_PASS_16 }}
+          BREVO_PASS_17:    ${{ secrets.BREVO_PASS_17 }}
+          BREVO_PASS_18:    ${{ secrets.BREVO_PASS_18 }}
+          BREVO_PASS_19:    ${{ secrets.BREVO_PASS_19 }}
+        run: python klivio_v2.py --mode live
+
+      - name: Check replies
+        if: github.event.schedule == '0 * * * *'
+        env:
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REPLY_IMAP_USER:  ${{ secrets.REPLY_IMAP_USER }}
+          REPLY_IMAP_PASS:  ${{ secrets.REPLY_IMAP_PASS }}
+        run: python klivio_v2.py --mode check
+
+      - name: Daily digest
+        if: github.event.schedule == '0 18 * * 1-5'
+        env:
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python klivio_v2.py --mode digest
+
+      - name: Manual run
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          YOUR_EMAIL:       ${{ secrets.YOUR_EMAIL }}
+          GROQ_API_KEY:     ${{ secrets.GROQ_API_KEY }}
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BREVO_PASS_1:     ${{ secrets.BREVO_PASS_1 }}
+          BREVO_PASS_2:     ${{ secrets.BREVO_PASS_2 }}
+          BREVO_PASS_3:     ${{ secrets.BREVO_PASS_3 }}
+          BREVO_PASS_4:     ${{ secrets.BREVO_PASS_4 }}
+          BREVO_PASS_5:     ${{ secrets.BREVO_PASS_5 }}
+          BREVO_PASS_6:     ${{ secrets.BREVO_PASS_6 }}
+          BREVO_PASS_7:     ${{ secrets.BREVO_PASS_7 }}
+          BREVO_PASS_8:     ${{ secrets.BREVO_PASS_8 }}
+          BREVO_PASS_9:     ${{ secrets.BREVO_PASS_9 }}
+          BREVO_PASS_10:    ${{ secrets.BREVO_PASS_10 }}
+          BREVO_PASS_11:    ${{ secrets.BREVO_PASS_11 }}
+          BREVO_PASS_12:    ${{ secrets.BREVO_PASS_12 }}
+          BREVO_PASS_13:    ${{ secrets.BREVO_PASS_13 }}
+          BREVO_PASS_14:    ${{ secrets.BREVO_PASS_14 }}
+          BREVO_PASS_15:    ${{ secrets.BREVO_PASS_15 }}
+          BREVO_PASS_16:    ${{ secrets.BREVO_PASS_16 }}
+          BREVO_PASS_17:    ${{ secrets.BREVO_PASS_17 }}
+          BREVO_PASS_18:    ${{ secrets.BREVO_PASS_18 }}
+          BREVO_PASS_19:    ${{ secrets.BREVO_PASS_19 }}
+        run: python klivio_v2.py --mode ${{ github.event.inputs.mode }}
